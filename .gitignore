@@ -1,0 +1,25 @@
+/target
+*.db
+*.xml
+
+# Fingerprint caches. redb databases, written wherever --cache points;
+# `--cache test` in the repo root once committed a 3.6MB one.
+*.redb
+/test
+
+# Static FFmpeg + dav1d prefix built by scripts/build-ffmpeg-static.sh.
+# Several hundred MB of archives, headers and upstream checkouts, all
+# reproducible from the pinned versions in that script.
+/ffmpeg-static
+
+# Ignore local accuracy test file
+/tests/local_accuracy_test.rs
+# Ground-truth corpus labeling: generated pools, contact sheets and the
+# review page. All reproducible from benchmark/gt.py against a local corpus.
+/benchmark
+!/flatpak/*.metainfo.xml
+
+# Flatpak builds (flatpak/): the build tree, builder's cache and a local repo.
+/build-flatpak/
+/.flatpak-builder/
+/repo-flatpak/

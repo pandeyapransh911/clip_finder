@@ -1,0 +1,512 @@
+# .github/workflows/release.yml
+#
+# Builds a release binary and attaches it to a GitHub Release when you push a
+# version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+#
+# The binary is STATIC with respect to FFmpeg: it carries its own FFmpeg 8 and
+# dav1d and needs nothing installed on the target beyond glibc. That is what
+# makes one artifact enough. A dynamically linked build would record
+# libavcodec.so.<N> in DT_NEEDED and refuse to start on any host whose FFmpeg
+# major differs -- and the field spans sonames 58 through 62, so "just ship a
+# few" would mean five builds, five base images, and five subtly different
+# tools, since decoder output is not identical across FFmpeg majors.
+#
+# glibc is the one thing it still links dynamically, and a binary asks for the
+# glibc it was linked against. Built on a 22.04 runner that was 2.35, which
+# left out RHEL 8 and its rebuilds, Debian 10 and 11, and Ubuntu 20.04. So the
+# CLI, FFmpeg and dav1d are built and tested in AlmaLinux 8 (the
+# manylinux_2_28 image, glibc 2.28) by scripts/manylinux-build.sh, and
+# "Verify the binary" holds it to that floor. The window needs GTK 4.10 and so
+# a newer system anyway; it is built on the runner from the same archives.
+#
+# Each release publishes:
+#   vid-fp-<version>-x86_64-linux-gnu  -> archival, one per release
+#   vid-fp-x86_64-linux-gnu            -> stable name, so this URL always works:
+#     https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
+#   vid-fp-<version>-extras.tar.gz     -> completions, man page, desktop entry
+#                                         and icon
+#   vid-fp-gui-<version>-x86_64-linux-gnu, vid-fp-gui-x86_64-linux-gnu
+#                                      -> the desktop app, same two names
+#                                         (`build-gui`); FFmpeg bundled the
+#                                         same way, GTK 4 from the system
+#   vid-fp-<version>-x86_64.flatpak, vid-fp-x86_64.flatpak
+#                                      -> the desktop app as a Flatpak
+#                                         (`flatpak`): GTK 4 from the GNOME
+#                                         runtime, FFmpeg 8 + dav1d shared
+#   vid-fp-<version>-ffmpeg-static-libs.tar.gz
+#     -> the LGPL relink kit; see scripts/package-relink-kit.sh. Not optional.
+#   vid-fp-<version>-aarch64-linux-gnu, vid-fp-aarch64-linux-gnu,
+#   vid-fp-<version>-aarch64-ffmpeg-static-libs.tar.gz
+#     -> the same CLI and kit for 64-bit ARM (`build-arm64`, which is
+#        aarch64.yml called with the tag, then `publish-arm64`)
+#
+# The same tag also publishes the crate to crates.io (`publish-crate`),
+# gated on the binary build so nothing reaches a registry that cannot take
+# a version back.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create/update the GitHub Release
+
+jobs:
+  build-static:
+    name: Static binary (bundles FFmpeg 8 + dav1d, glibc 2.28)
+    # The runner only hosts the container; the glibc that matters is the
+    # image's. See the note at the top.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # The prefix is ~10 minutes of build, and it only changes when the pinned
+      # versions in the script do -- so the script itself is the cache key,
+      # with the image it was built in, since the archives carry its glibc.
+      - name: Cache static FFmpeg prefix
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-manylinux_2_28-x86_64-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+
+      - name: Build and test in manylinux_2_28
+        # FFmpeg + dav1d (a no-op when the cache above was restored), then
+        # `cargo build` and `cargo test` with the same feature flags, which is
+        # what makes the test safe: a bare `cargo test --release` would
+        # overwrite target/release/vid-fp with a DYNAMIC binary and every check
+        # below this point -- DT_NEEDED, AV1, the packaging -- would then be
+        # measuring the wrong file. The image has no libav*-dev, so a mistake
+        # in the FFMPEG_DIR wiring fails the build instead of quietly linking
+        # a system FFmpeg.
+        #
+        # This is the only place the suite runs against the vendored FFmpeg 8.
+        # ci.yml tests the dynamic build against the runner's FFmpeg 6, which
+        # is a different decoder; CLAUDE.md's note that accuracy numbers only
+        # mean something from the static build applies to the unit tests too.
+        #
+        # The checkout is mounted at its own path so the prefix's .pc files
+        # are right outside the container too (the relink kit and build-gui
+        # read them).
+        run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" -e FFMPEG_DIR="$PWD/ffmpeg-static" \
+            quay.io/pypa/manylinux_2_28_x86_64 scripts/manylinux-build.sh
+
+      - name: Verify the binary is actually self-contained
+        # Each of these has been a real failure mode: linking the system FFmpeg
+        # by accident, and configuring FFmpeg without dav1d so that every AV1
+        # file fails to fingerprint while everything else still passes. And
+        # nothing in it may ask for a glibc newer than the one the release
+        # notes promise.
+        run: |
+          BIN=target/release/vid-fp
+          if objdump -p "$BIN" | grep -qE 'NEEDED.*lib(av|sw)'; then
+            echo "::error::binary links FFmpeg dynamically:"
+            objdump -p "$BIN" | grep NEEDED
+            exit 1
+          fi
+          if ! "$BIN" --version >/dev/null; then
+            echo "::error::binary does not run"; exit 1
+          fi
+          echo "DT_NEEDED:"; objdump -p "$BIN" | grep NEEDED
+          NEWEST="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "newest glibc symbol: $NEWEST"
+          if [ "$(printf '%s\nGLIBC_2.28\n' "$NEWEST" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::the binary needs $NEWEST; the release notes promise glibc 2.28"
+            exit 1
+          fi
+
+      - name: Verify AV1 decoding works
+        # Generated rather than committed: a few frames of noise in AV1 is
+        # enough to prove libdav1d is wired in, and it keeps a binary fixture
+        # out of the repo. libaom here is only the ENCODER used to make the
+        # sample -- it has nothing to do with what vid-fp links.
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p /tmp/av1check
+          ffmpeg -v error -f lavfi -i "testsrc=size=320x240:rate=10:duration=6" \
+            -c:v libaom-av1 -cpu-used 8 -g 10 /tmp/av1check/a.mkv
+          cp /tmp/av1check/a.mkv /tmp/av1check/b.mkv
+          if ! ./target/release/vid-fp /tmp/av1check -q; then
+            echo "::error::vid-fp failed on AV1 input -- dav1d is probably not linked"
+            exit 1
+          fi
+
+      - name: The fixtures' report is the reviewed x86_64 one
+        # A checksum of a report of the fixtures, which every fingerprint
+        # figure feeds: a change here is a change in what the release
+        # fingerprints, and needs a CACHE_TABLE rename. aarch64.yml holds the
+        # ARM build to its own sum (the scaler rounds differently there).
+        # Refresh both when the fixtures or the report layout change. Exit 2
+        # is expected: one fixture is featureless on purpose.
+        run: |
+          rc=0
+          ./target/release/vid-fp "$PWD/tests/fixtures" -d 10 -q \
+            --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
+          if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
+          GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
+          if [ "$GOT" != "445c2b370e95668d" ]; then
+            echo "::error::the fixtures' report is $GOT, not the reviewed 445c2b370e95668d"
+            cat "$RUNNER_TEMP/fx.csv"
+            exit 1
+          fi
+
+      - name: Package artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN=target/release/vid-fp
+          mkdir -p dist/extras/completions dist/extras/man
+          "$BIN" --completions bash > dist/extras/completions/vid-fp.bash
+          "$BIN" --completions zsh  > dist/extras/completions/_vid-fp
+          "$BIN" --completions fish > dist/extras/completions/vid-fp.fish
+          "$BIN" --man              > dist/extras/man/vid-fp.1
+          mkdir -p dist/extras/applications dist/extras/icons
+          cp data/io.github.danielnara24.vid-fp.desktop dist/extras/applications/
+          cp data/io.github.danielnara24.vid-fp.svg dist/extras/icons/
+          tar -C dist/extras -czf "dist/vid-fp-${VERSION}-extras.tar.gz" completions man applications icons
+          rm -rf dist/extras
+          # Same binary, two names: a versioned copy for history and a stable
+          # copy so the /releases/latest/download/ URL never changes.
+          cp "$BIN" "dist/vid-fp-${VERSION}-x86_64-linux-gnu"
+          cp "$BIN" "dist/vid-fp-x86_64-linux-gnu"
+
+      - name: Package the LGPL relink kit
+        # FFmpeg is LGPL 2.1+ and linked statically; see the script for why
+        # this is an obligation and what it proves before shipping.
+        run: scripts/package-relink-kit.sh "${GITHUB_REF_NAME#v}" "vid-fp-${GITHUB_REF_NAME#v}-ffmpeg-static-libs"
+
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *; do [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          body: |
+            Static x86_64 Linux binary. No FFmpeg installation required --
+            FFmpeg 8 and dav1d (for AV1) are bundled.
+
+            ```bash
+            curl -L -o vid-fp \
+              https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
+            chmod +x vid-fp && sudo install -m 755 vid-fp /usr/local/bin/vid-fp
+            ```
+
+            Requires glibc 2.28 or newer (Ubuntu 20.04+, Debian 10+, RHEL 8+,
+            Fedora 29+).
+
+            The desktop app, `vid-fp-gui`, bundles FFmpeg the same way and
+            needs GTK 4.10 or newer (Ubuntu 23.04+, Debian 13+, Fedora 38+):
+
+            ```bash
+            sudo apt install libgtk-4-1
+            curl -L -o vid-fp-gui \
+              https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-gui-x86_64-linux-gnu
+            chmod +x vid-fp-gui && sudo install -m 755 vid-fp-gui /usr/local/bin/vid-fp-gui
+            ```
+
+            On 64-bit ARM (Raspberry Pi 4/5 with a 64-bit OS, Graviton,
+            Ampere), download `vid-fp-aarch64-linux-gnu` instead; the same
+            glibc 2.28 floor applies.
+
+            `*-ffmpeg-static-libs.tar.gz` is the LGPL relink kit -- see
+            `RELINKING.md` inside it. vid-fp itself remains MIT OR Apache-2.0.
+
+  build-arm64:
+    name: aarch64 binary
+    # The whole of aarch64.yml -- build and test in manylinux_2_28_aarch64,
+    # glibc floor, AV1, the fixtures against x86_64 -- with the files named
+    # for this tag. Alongside the x86_64 build, not after it.
+    uses: ./.github/workflows/aarch64.yml
+    with:
+      tag: ${{ github.ref_name }}
+
+  publish-arm64:
+    name: Publish the aarch64 binary
+    # After build-static too, so the two never race to create the release.
+    needs: [build-static, build-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: vid-fp-aarch64
+          path: dist
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
+  build-gui:
+    name: Desktop app (bundles FFmpeg 8 + dav1d, links the system's GTK 4)
+    # Not in the CLI's AlmaLinux 8: the window needs GTK 4.10, so a system
+    # that new anyway. After the CLI, so the two never race to create the
+    # release, and so the FFmpeg prefix it cached is there to restore: the
+    # window links the very archives the CLI was built and tested with.
+    needs: build-static
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        # As the CLI's job, no libav*-dev, plus GTK 4.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git make nasm pkg-config \
+            python3 python3-venv clang libgtk-4-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gui
+
+      - name: Cache static FFmpeg prefix
+        uses: actions/cache@v6
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-manylinux_2_28-x86_64-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+
+      - name: Build static FFmpeg + dav1d
+        # A no-op when the cache above was restored, which is the usual case.
+        # On a miss it builds the same versions here instead, with this
+        # runner's glibc, which the window's floor (GTK 4.10) is above anyway.
+        run: ./scripts/build-ffmpeg-static.sh "$PWD/ffmpeg-static"
+
+      - name: Build
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo build --release --locked --features static-ffmpeg,gui --bin vid-fp-gui
+
+      - name: Test
+        # The window's own tests, and tests/window_matches_cli.rs, which runs
+        # this vid-fp-gui's scan beside a vid-fp of the same build and demands
+        # the same groups and labels. Same features as the Build above, so
+        # target/release/vid-fp-gui is still the binary that ships.
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo test --release --locked --features static-ffmpeg,gui --bin vid-fp-gui --test window_matches_cli
+
+      - name: Verify the binary
+        # FFmpeg bundled, not linked; and its scan runs without a display, so
+        # it can be smoke tested: an empty folder is a clean run that finds
+        # nothing.
+        run: |
+          BIN=target/release/vid-fp-gui
+          if objdump -p "$BIN" | grep -qE 'NEEDED.*lib(av|sw)'; then
+            echo "::error::the window links FFmpeg dynamically:"
+            objdump -p "$BIN" | grep NEEDED
+            exit 1
+          fi
+          echo "DT_NEEDED:"; objdump -p "$BIN" | grep NEEDED
+          echo "newest glibc symbol: $(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          "$BIN" --version
+          mkdir -p "$RUNNER_TEMP/empty"
+          "$BIN" --worker "$RUNNER_TEMP/r.json" vid-fp --cache "$RUNNER_TEMP/c.redb" -- "$RUNNER_TEMP/empty"
+          grep -q '"found":0' "$RUNNER_TEMP/r.json"
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp target/release/vid-fp-gui "dist/vid-fp-gui-${VERSION}-x86_64-linux-gnu"
+          cp target/release/vid-fp-gui "dist/vid-fp-gui-x86_64-linux-gnu"
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
+  flatpak:
+    name: Flatpak bundle
+    # The desktop app with GTK 4 from the GNOME runtime, for distributions
+    # whose own GTK is older than 4.10 (Ubuntu 22.04). FFmpeg and dav1d are
+    # the release's versions, built by the same script, as shared libraries.
+    # Built from the same manifest as a local flatpak-builder build, offline,
+    # from flatpak/cargo-sources.json. After the window's job, so it ships
+    # only what was tested and never races it to create the release.
+    needs: build-gui
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check cargo-sources.json matches Cargo.lock
+        # A crate in Cargo.lock that the generated sources lack fails the
+        # offline build half an hour in; say which one here instead.
+        run: |
+          python3 - <<'PY'
+          import json, re
+          lock = set(re.findall(r'name = "([^"]+)"\nversion = "([^"]+)"\nsource = "registry', open("Cargo.lock").read()))
+          dests = {s.get("dest", "") for s in json.load(open("flatpak/cargo-sources.json"))}
+          missing = sorted(f"{n}-{v}" for n, v in lock if f"cargo/vendor/{n}-{v}" not in dests)
+          if missing:
+              raise SystemExit("::error::flatpak/cargo-sources.json is out of date; regenerate it from Cargo.lock. Missing: " + ", ".join(missing))
+          PY
+
+      - name: Check the metainfo names this release
+        # Software centres show the newest <release> as what is installed.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NEWEST=$(grep -o '<release version="[^"]*"' flatpak/io.github.danielnara24.vid-fp.metainfo.xml | head -1 | cut -d'"' -f2)
+          if [ "$NEWEST" != "$VERSION" ]; then
+            echo "::error::add a <release> for $VERSION at the top of the metainfo's <releases> (newest is $NEWEST)"
+            exit 1
+          fi
+
+      - name: Take the image's Flatpak installation off its lower layer
+        # The image ships the runtimes preinstalled in a lower layer of its
+        # overlay filesystem, and on runners whose overlayfs cannot redirect a
+        # directory rename out of one, updating them fails with EXDEV
+        # ("Invalid cross-device link"), which flatpak-builder then reports as
+        # exit 139. A copy lives wholly in the writable layer, where renames
+        # work. 0.41.0's first run failed exactly so.
+        run: |
+          for d in $(flatpak --installations) "$HOME/.local/share/flatpak"; do
+            [ -d "$d" ] || continue
+            cp -a "$d" "$d.copy" && rm -rf "$d" && mv "$d.copy" "$d"
+          done
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: vid-fp-x86_64.flatpak
+          manifest-path: flatpak/io.github.danielnara24.vid-fp.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - name: Verify the bundle
+        # The window's scan runs without a display, so the installed app can
+        # be smoke tested as the binary is: an empty folder is a clean run.
+        # FFmpeg must be the bundled one (the runtime has a libavcodec of the
+        # same soname and fewer decoders), and AV1 must decode.
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive vid-fp-x86_64.flatpak
+          APP=io.github.danielnara24.vid-fp
+          flatpak run --command=vid-fp $APP --version
+          mkdir -p "$HOME/check/empty"
+          flatpak run --command=vid-fp-gui $APP --worker "$HOME/check/r.json" vid-fp -- "$HOME/check/empty"
+          grep -q '"found":0' "$HOME/check/r.json"
+          flatpak run --command=sh $APP -c 'ldd /app/bin/vid-fp' | tee "$HOME/check/ldd"
+          grep -q 'libavcodec.so.62 => /app/lib/' "$HOME/check/ldd"
+          dnf install -y ffmpeg-free 2>/dev/null || apt-get install -y ffmpeg 2>/dev/null || true
+          if command -v ffmpeg >/dev/null; then
+            mkdir -p "$HOME/check/av1"
+            ffmpeg -v error -f lavfi -i "testsrc=size=320x240:rate=10:duration=6" \
+              -c:v libaom-av1 -cpu-used 8 -g 10 "$HOME/check/av1/a.mkv"
+            cp "$HOME/check/av1/a.mkv" "$HOME/check/av1/b.mkv"
+            flatpak run --command=vid-fp $APP "$HOME/check/av1" -q
+          else
+            echo "::warning::no ffmpeg in the container to make an AV1 sample; AV1 not checked"
+          fi
+
+      - name: Upload to release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp vid-fp-x86_64.flatpak "dist/vid-fp-${VERSION}-x86_64.flatpak"
+          cp vid-fp-x86_64.flatpak dist/vid-fp-x86_64.flatpak
+          cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
+  publish-crate:
+    name: Publish to crates.io
+    # Gated on the static build, and deliberately so: a GitHub Release can be
+    # deleted and re-cut, while a crates.io version can only be yanked and its
+    # number is spent for ever. Nothing reaches the registry from a tag that
+    # could not produce a working binary.
+    needs: build-static
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # this job publishes elsewhere; it writes nothing here
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install FFmpeg development libraries
+        # The opposite of the build job above, on purpose. What crates.io ships
+        # is source, built by `cargo install vid-fp` against the user's SHARED
+        # FFmpeg -- so the verification build `cargo publish` runs before
+        # uploading has to be that build. Nothing here sets FFMPEG_DIR: a
+        # prebuilt prefix would verify a binary no crates.io user will ever get.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            clang pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the token is configured
+        # Failing here costs nothing; failing inside `cargo publish` happens
+        # after a full verification build.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Check the tag matches Cargo.toml
+        # The version lives in two places now: the tag that triggers this
+        # workflow and the `version` cargo publishes. They drift silently, and
+        # the drift is expensive in one direction -- publishing 0.37.16 from a
+        # tag called v0.37.17 cannot be undone, only yanked. Read out of the
+        # [package] section alone, so a dependency's `version` cannot answer.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          if [ -z "$CRATE" ]; then
+            echo "::error::could not read version from Cargo.toml [package]"
+            exit 1
+          fi
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "publishing vid-fp $CRATE"
+
+      - name: Skip if this version is already published
+        # Re-running a release to fix an artifact must not hard-fail on
+        # `crate version already exists`. A version goes up once; every later
+        # run of the same tag is a no-op rather than a red cross.
+        id: published
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -H 'User-Agent: vid-fp release workflow' \
+                    "https://crates.io/api/v1/crates/vid-fp/$VERSION")"
+          if [ "$CODE" = "200" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::vid-fp $VERSION is already on crates.io; not publishing again"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.published.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --locked so the registry gets the dependency versions this release was
+        # tested against, the same flag the build and test steps above use.
+        run: cargo publish --locked
