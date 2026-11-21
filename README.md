@@ -1,10 +1,5 @@
 # vid-fp
 
-[![Release](https://img.shields.io/github/v/release/Danielnara24/vid-fp?logo=github)](https://github.com/Danielnara24/vid-fp/releases/latest)
-[![crates.io](https://img.shields.io/crates/v/vid-fp?logo=rust)](https://crates.io/crates/vid-fp)
-[![CI](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml/badge.svg)](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-
 **Find duplicate videos from the Linux command line**, including clips cut out
 of a longer recording.
 
@@ -40,8 +35,7 @@ redundant copies to the system trash, `--move-to` relocates them instead, and
 text, CSV or JSON, and `--from-report` acts on one you have reviewed and edited
 by hand.
 
-There is no daemon and nothing running in the background, and the
-[desktop app](#desktop-app) is optional. Fingerprints are cached between runs,
+There is no daemon and nothing running in the background, and the desktop app is optional. Fingerprints are cached between runs,
 so re-scanning a library only decodes the files that changed.
 
 ## Requirements
@@ -767,20 +761,3 @@ still reaches files with no extension.
   prompt and the size check, but nothing else: the edited file is the decision,
   and it is not checked for leaving a survivor in each group. A row it cannot
   understand is never guessed at; the file is left alone and the run exits `2`.
-
-## License
-
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
-your option.
-
-The **released binary** additionally contains FFmpeg (LGPL 2.1+) and dav1d
-(BSD-2-Clause), statically linked. That does not affect the licence above, but
-because the FFmpeg link is static, LGPL 2.1 §6 entitles you to relink the
-program against your own build of FFmpeg. Every release therefore ships
-`vid-fp-<version>-ffmpeg-static-libs.tar.gz` (and
-`vid-fp-<version>-aarch64-ffmpeg-static-libs.tar.gz` for ARM) with the archives, headers, build
-script and instructions needed to do that. The FFmpeg in it is configured
-`--disable-gpl --disable-nonfree`, so it is LGPL only.
-
-A `cargo install` build links your system's shared FFmpeg and none of this
-applies to it. See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
